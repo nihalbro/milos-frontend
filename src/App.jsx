@@ -1,215 +1,164 @@
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
 
-const socket = io("http://localhost:3001");
+const socket = io(import.meta.env.VITE_BACKEND_URL);
 
 function App() {
-  const [myStream, setMyStream] = useState(null);
-  const [partnerStream, setPartnerStream] = useState(null);
-  const [peerConnection, setPeerConnection] = useState(null);
-  const [connected, setConnected] = useState(false);
-  const [partnerTyping, setPartnerTyping] = useState(false);
-  const [message, setMessage] = useState("");
+  const [remoteSocketId, setRemoteSocketId] = useState(null);
+  const [myStream, setMyStream] = useState();
+  const [remoteStream, setRemoteStream] = useState();
+  const peerConnection = useRef(null);
 
-  const myVideo = useRef();
-  const partnerVideo = useRef();
+  const myVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
 
-  useEffect(() => {
-    navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then((stream) => {
-      setMyStream(stream);
-      myVideo.current.srcObject = stream;
+  const handleCallUser = () => {
+    peerConnection.current = new RTCPeerConnection();
+
+    myStream.getTracks().forEach(track => {
+      peerConnection.current.addTrack(track, myStream);
     });
 
-    socket.on("partner-connected", async (partnerId) => {
-      setConnected(true);
-      const pc = createPeerConnection(partnerId);
-      setPeerConnection(pc);
-      myStream.getTracks().forEach((track) => {
-        pc.addTrack(track, myStream);
-      });
+    peerConnection.current.ontrack = event => {
+      const remoteStream = event.streams[0];
+      setRemoteStream(remoteStream);
+    };
 
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit("signal", { to: partnerId, signal: offer });
-    });
-
-    socket.on("signal", async ({ from, signal }) => {
-      let pc = peerConnection;
-      if (!pc) {
-        pc = createPeerConnection(from);
-        setPeerConnection(pc);
-        myStream.getTracks().forEach((track) => {
-          pc.addTrack(track, myStream);
+    peerConnection.current.onicecandidate = event => {
+      if (event.candidate) {
+        socket.emit("ice-candidate", {
+          candidate: event.candidate,
+          to: remoteSocketId,
         });
       }
+    };
 
-      if (signal.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(signal));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("signal", { to: from, signal: answer });
-      } else if (signal.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(signal));
-      } else if (signal.candidate) {
-        try {
-          await pc.addIceCandidate(signal);
-        } catch (e) {
-          console.error(e);
-        }
-      }
+    peerConnection.current
+      .createOffer()
+      .then(offer => {
+        peerConnection.current.setLocalDescription(offer);
+        socket.emit("call-user", { offer, to: remoteSocketId });
+      });
+  };
+
+  const handleIncomingCall = async ({ from, offer }) => {
+    setRemoteSocketId(from);
+
+    peerConnection.current = new RTCPeerConnection();
+
+    myStream.getTracks().forEach(track => {
+      peerConnection.current.addTrack(track, myStream);
     });
 
-    socket.on("partner-disconnected", () => {
-      setConnected(false);
-      setPartnerStream(null);
-      if (partnerVideo.current) {
-        partnerVideo.current.srcObject = null;
+    peerConnection.current.ontrack = event => {
+      const remoteStream = event.streams[0];
+      setRemoteStream(remoteStream);
+    };
+
+    peerConnection.current.onicecandidate = event => {
+      if (event.candidate) {
+        socket.emit("ice-candidate", {
+          candidate: event.candidate,
+          to: from,
+        });
       }
-      if (peerConnection) {
-        peerConnection.close();
-      }
+    };
+
+    await peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await peerConnection.current.createAnswer();
+    await peerConnection.current.setLocalDescription(answer);
+
+    socket.emit("answer-call", { answer, to: from });
+  };
+
+  const handleCallAccepted = async ({ answer }) => {
+    await peerConnection.current.setRemoteDescription(new RTCSessionDescription(answer));
+  };
+
+  const handleIceCandidate = async ({ candidate }) => {
+    try {
+      await peerConnection.current.addIceCandidate(candidate);
+    } catch (err) {
+      console.error("Error adding received ice candidate", err);
+    }
+  };
+
+  useEffect(() => {
+    socket.on("user-joined", ({ id }) => {
+      setRemoteSocketId(id);
     });
 
-    socket.on("typing", () => setPartnerTyping(true));
-    socket.on("stop-typing", () => setPartnerTyping(false));
+    socket.on("incoming-call", handleIncomingCall);
+    socket.on("call-accepted", handleCallAccepted);
+    socket.on("ice-candidate", handleIceCandidate);
+
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      .then(stream => {
+        setMyStream(stream);
+      })
+      .catch(err => console.error("Failed to get local stream", err));
+
+    return () => {
+      socket.off("user-joined");
+      socket.off("incoming-call");
+      socket.off("call-accepted");
+      socket.off("ice-candidate");
+    };
+  }, []);
+
+  useEffect(() => {
+    if (myVideoRef.current && myStream) {
+      myVideoRef.current.srcObject = myStream;
+    }
   }, [myStream]);
 
-  const createPeerConnection = (partnerId) => {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        socket.emit("signal", { to: partnerId, signal: e.candidate });
-      }
-    };
-
-    pc.ontrack = (e) => {
-      setPartnerStream(e.streams[0]);
-      if (partnerVideo.current) {
-        partnerVideo.current.srcObject = e.streams[0];
-      }
-    };
-
-    return pc;
-  };
-
-  const handleSkip = () => {
-    if (peerConnection) peerConnection.close();
-    setPartnerStream(null);
-    if (partnerVideo.current) partnerVideo.current.srcObject = null;
-    setConnected(false);
-    socket.emit("skip");
-  };
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+  }, [remoteStream]);
 
   return (
-    <div style={{ 
-      position: "relative", 
-      width: "100vw", 
-      height: "100vh", 
-      backgroundColor: "#121212", 
-      color: "#fff", 
-      fontFamily: "Arial, sans-serif",
-      overflow: "hidden"
-    }}>
-      <video
-        ref={partnerVideo}
-        autoPlay
-        playsInline
-        style={{
-          width: "100%",
-          height: "100%",
-          objectFit: "cover",
-          filter: partnerStream ? "none" : "blur(8px)",
-          transition: "filter 0.3s",
-        }}
-      />
+    <div className="flex flex-col h-screen bg-black text-white p-4">
+      <h1 className="text-2xl font-bold text-center mb-4">Milos - Talk to Strangers</h1>
 
-      <video
-        ref={myVideo}
-        autoPlay
-        playsInline
-        muted
-        style={{
-          position: "absolute",
-          width: "220px",
-          height: "160px",
-          bottom: "100px",
-          right: "20px",
-          borderRadius: "10px",
-          border: "2px solid #ffffff88",
-          objectFit: "cover",
-          backgroundColor: "#000",
-        }}
-      />
-
-      {partnerTyping && (
-        <div
-          style={{
-            position: "absolute",
-            top: 20,
-            left: 20,
-            background: "rgba(255, 255, 255, 0.08)",
-            padding: "8px 16px",
-            borderRadius: "8px",
-            color: "#ccc",
-            fontSize: "14px",
-            backdropFilter: "blur(4px)",
-          }}
-        >
-          Stranger is typing...
+      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-gray-900 rounded-lg p-2 flex justify-center items-center h-full">
+          <video
+            className="w-full h-full rounded object-cover"
+            ref={myVideoRef}
+            autoPlay
+            muted
+          />
         </div>
-      )}
+        <div className="bg-gray-900 rounded-lg p-2 flex justify-center items-center h-full">
+          {remoteStream ? (
+            <video
+              className="w-full h-full rounded object-cover"
+              ref={remoteVideoRef}
+              autoPlay
+            />
+          ) : (
+            <p className="text-center">Waiting for a partner...</p>
+          )}
+        </div>
+      </div>
 
-      <input
-        type="text"
-        value={message}
-        onChange={(e) => {
-          setMessage(e.target.value);
-          socket.emit("typing");
-          clearTimeout(window.typingTimeout);
-          window.typingTimeout = setTimeout(() => {
-            socket.emit("stop-typing");
-          }, 1000);
-        }}
-        placeholder="Type a message..."
-        style={{
-          position: "absolute",
-          bottom: 30,
-          left: "50%",
-          transform: "translateX(-50%)",
-          width: "70%",
-          padding: "12px",
-          fontSize: "16px",
-          borderRadius: "10px",
-          border: "1px solid #444",
-          backgroundColor: "#1e1e1e",
-          color: "#fff",
-          outline: "none",
-        }}
-      />
-
-      <button
-        onClick={handleSkip}
-        style={{
-          position: "absolute",
-          top: 20,
-          right: 20,
-          padding: "10px 25px",
-          fontSize: "16px",
-          backgroundColor: "#ff4d4d",
-          color: "#fff",
-          border: "none",
-          borderRadius: "8px",
-          cursor: "pointer",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
-        }}
-      >
-        Skip
-      </button>
+      <div className="mt-4 text-center">
+        {remoteSocketId ? (
+          <button
+            onClick={handleCallUser}
+            className="px-6 py-2 bg-blue-600 rounded hover:bg-blue-700"
+          >
+            Call Stranger
+          </button>
+        ) : (
+          <p>Looking for someone to connect...</p>
+        )}
+      </div>
     </div>
   );
 }
 
 export default App;
+
